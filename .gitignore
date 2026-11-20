@@ -1,0 +1,26 @@
+# Build artifacts and temporary files
+build/
+dist/
+_temp/
+_engine/
+*.7z
+*.7z.sha256
+*.zip
+*.log
+
+# Local test directories
+Chrome/
+Data/
+Cache/
+Chrome.lnk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# OS specific
+.DS_Store
+Thumbs.db

@@ -1,0 +1,107 @@
+name: Chrome Portable Build & Update Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force build even if already released'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # 每天北京时间 09:00 (UTC 01:00) 运行
+    - cron: '0 1 * * *'
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+
+concurrency:
+  group: chrome-portable-build
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check Updates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      update_needed: ${{ steps.check.outputs.update_needed }}
+      chrome_version: ${{ steps.check.outputs.chrome_version }}
+      chrome_url: ${{ steps.check.outputs.chrome_url }}
+      chrome_sha256: ${{ steps.check.outputs.chrome_sha256 }}
+      chrome_size: ${{ steps.check.outputs.chrome_size }}
+      chrome_plus_version: ${{ steps.check.outputs.chrome_plus_version }}
+      chrome_plus_url: ${{ steps.check.outputs.chrome_plus_url }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_title: ${{ steps.check.outputs.release_title }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run update check
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          FORCE_FLAG=""
+          if [ "${{ inputs.force }}" = "true" ]; then
+            FORCE_FLAG="--force"
+          fi
+          python scripts/check_update.py $FORCE_FLAG
+
+      - name: Summary
+        run: |
+          echo "### 更新检查结果" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 详情 |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Chrome 最新版** | \`${{ steps.check.outputs.chrome_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Chrome++ 最新版** | \`${{ steps.check.outputs.chrome_plus_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **目标 Tag** | \`${{ steps.check.outputs.release_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **是否需要构建** | \`${{ steps.check.outputs.update_needed }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  build:
+    name: Build & Release
+    needs: check
+    if: github.event_name != 'schedule' || needs.check.outputs.update_needed == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build portable package
+        id: build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/build_portable.py `
+            --chrome-version "${{ needs.check.outputs.chrome_version }}" `
+            --chrome-url "${{ needs.check.outputs.chrome_url }}" `
+            --chrome-sha256 "${{ needs.check.outputs.chrome_sha256 }}" `
+            --plus-version "${{ needs.check.outputs.chrome_plus_version }}" `
+            --plus-url "${{ needs.check.outputs.chrome_plus_url }}"
+
+      - name: Publish to GitHub Releases
+        if: needs.check.outputs.update_needed == 'true' || inputs.force == true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/release_helper.py `
+            --chrome-version "${{ needs.check.outputs.chrome_version }}" `
+            --plus-version "${{ needs.check.outputs.chrome_plus_version }}" `
+            --archive-path "build/assets/$env:ARCHIVE_NAME"
