@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -133,7 +134,8 @@ def upload_asset(upload_url_template, file_path, token):
 
     # upload_url_template 通常形如 "https://uploads.github.com/repos/.../assets{?name,label}"
     base_upload_url = upload_url_template.split("{")[0]
-    upload_url = f"{base_upload_url}?name={file_path.name}"
+    encoded_name = urllib.parse.quote(file_path.name)
+    upload_url = f"{base_upload_url}?name={encoded_name}"
 
     content_type = "application/x-7z-compressed" if file_path.suffix == ".7z" else "text/plain"
     headers = {
@@ -191,9 +193,16 @@ def main():
         "User-Agent": "ChromePortableReleaseHelper",
     }
     existing_assets = release_data.get("assets", [])
-    target_names = {archive_path.name, sha256_path.name}
+    target_names = {
+        archive_path.name,
+        sha256_path.name,
+        archive_path.name.replace("++", " "),
+        archive_path.name.replace("++", "."),
+        sha256_path.name.replace("++", " "),
+        sha256_path.name.replace("++", "."),
+    }
     for asset in existing_assets:
-        if asset.get("name") in target_names:
+        if asset.get("name") in target_names or asset.get("name", "").startswith("Chrome"):
             print(f"[ASSET] 发现旧资产 {asset.get('name')}，正在删除...")
             del_req = urllib.request.Request(asset["url"], headers=headers, method="DELETE")
             try:
