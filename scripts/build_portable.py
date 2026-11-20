@@ -2,10 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 Google Chrome 便携版自动化打包构建脚本
-实现：下载、校验、解包、剔除冗余组件、插件集成、配置合并、PE 注入、格式压缩与自测验证。
+实现：下载、哈希/大小校验、解包、剔除冗余组件、插件集成、配置合并(含UTF-16LE BOM)、
+PE 注入前后严格校验、格式压缩与全方位运行时闭环自测。
 """
 
 import argparse
+import ctypes
 import hashlib
 import os
 import shutil
@@ -17,12 +19,15 @@ import time
 import urllib.request
 from pathlib import Path
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+from common import (
+    archive_filename,
+    calc_sha256,
+    configure_utf8_stdio,
+    urlopen_with_retry,
+)
 
-# 项目根目录
+configure_utf8_stdio()
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = REPO_ROOT / "build"
 ASSETS_DIR = BUILD_DIR / "assets"
@@ -37,27 +42,6 @@ FORBIDDEN_FILES = {
 }
 
 
-def get_github_token():
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        return token
-    try:
-        proc = subprocess.run(
-            ["git", "credential", "fill"],
-            input="protocol=https\nhost=github.com\n",
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-        )
-        for line in proc.stdout.splitlines():
-            if line.startswith("password="):
-                return line.split("=", 1)[1]
-    except Exception:
-        pass
-    return None
-
-
 def find_7z():
     configured = os.environ.get("SEVEN_ZIP")
     if configured and Path(configured).exists():
@@ -66,7 +50,6 @@ def find_7z():
         found = shutil.which(name)
         if found:
             return found
-    # Check default installation paths
     default_paths = [
         r"C:\Program Files\7-Zip\7z.exe",
         r"C:\Program Files (x86)\7-Zip\7z.exe",
@@ -77,75 +60,77 @@ def find_7z():
     raise RuntimeError("未找到 7-Zip 工具，请安装 7-Zip 或设置 SEVEN_ZIP 环境变量。")
 
 
-def calc_sha256(file_path):
-    sha = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        while chunk := f.read(1024 * 1024):
-            sha.update(chunk)
-    return sha.hexdigest().lower()
-
-
-def download_file(url, dest_path, expected_sha256=None, token=None):
+def download_file(url, dest_path, expected_sha256=None, expected_size=None):
     dest_path = Path(dest_path)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
+    expected_sha256 = (expected_sha256 or "").strip().lower() or None
+    expected_size = int(expected_size) if expected_size else None
 
-    if dest_path.exists() and expected_sha256:
-        actual = calc_sha256(dest_path)
-        if actual == expected_sha256.lower():
+    if dest_path.exists():
+        size_ok = (expected_size is None) or (dest_path.stat().st_size == expected_size)
+        sha_ok = (expected_sha256 is None) or (calc_sha256(dest_path) == expected_sha256)
+        if (expected_sha256 or expected_size) and size_ok and sha_ok:
             print(f"[CACHE] 文件已存在且校验通过: {dest_path.name}")
             return dest_path
 
     print(f"[DOWNLOAD] 开始下载: {url} -> {dest_path.name}")
     headers = {"User-Agent": "ChromePortableBuilder/1.0"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
     req = urllib.request.Request(url, headers=headers)
-    sha = hashlib.sha256()
-    with urllib.request.urlopen(req, timeout=300) as resp, open(dest_path, "wb") as out:
-        total_size = int(resp.headers.get("content-length", 0))
-        downloaded = 0
-        last_pct = -1
-        while chunk := resp.read(1024 * 512):
-            out.write(chunk)
-            sha.update(chunk)
-            downloaded += len(chunk)
-            if total_size > 0:
-                pct = int(downloaded * 100 / total_size)
-                if pct != last_pct and pct % 10 == 0:
-                    print(f"  进度: {pct}% ({downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB)")
-                    last_pct = pct
+    part_path = dest_path.with_suffix(dest_path.suffix + ".part")
 
-    actual_sha = sha.hexdigest().lower()
-    if expected_sha256 and actual_sha != expected_sha256.lower():
-        dest_path.unlink(missing_ok=True)
-        raise RuntimeError(f"下载文件 SHA256 校验失败！期望: {expected_sha256}, 实际: {actual_sha}")
-    print(f"[DOWNLOAD] 下载完成: {dest_path.name} (SHA256: {actual_sha[:16]}...)")
+    sha = hashlib.sha256()
+    downloaded = 0
+    try:
+        with urlopen_with_retry(req, timeout=300) as resp, open(part_path, "wb") as out:
+            total_size = int(resp.headers.get("content-length", 0))
+            last_pct = -1
+            while chunk := resp.read(1024 * 512):
+                out.write(chunk)
+                sha.update(chunk)
+                downloaded += len(chunk)
+                if total_size > 0:
+                    pct = int(downloaded * 100 / total_size)
+                    if pct != last_pct and pct % 10 == 0:
+                        print(f"  进度: {pct}% ({downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB)")
+                        last_pct = pct
+
+        actual_sha = sha.hexdigest().lower()
+        if expected_size is not None and downloaded != expected_size:
+            raise RuntimeError(f"下载文件大小校验失败！期望: {expected_size}, 实际: {downloaded}")
+        if expected_sha256 and actual_sha != expected_sha256:
+            raise RuntimeError(f"下载文件 SHA256 校验失败！期望: {expected_sha256}, 实际: {actual_sha}")
+
+        part_path.replace(dest_path)
+    except Exception:
+        part_path.unlink(missing_ok=True)
+        raise
+
+    print(f"[DOWNLOAD] 下载完成: {dest_path.name} ({downloaded} 字节, SHA256: {actual_sha[:16]}...)")
     return dest_path
 
 
 def parse_ini_overrides(file_path):
     """解析 override.ini 文件中的各个 section 与 key-value"""
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"配置文件覆盖层不存在: {path}")
+
     overrides = {}
-    if not Path(file_path).exists():
-        return overrides
-    text = Path(file_path).read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")
     current_sec = "general"
-    for line in text.splitlines():
-        line = line.strip()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
         if not line or line.startswith(";"):
             continue
         if line.startswith("[") and line.endswith("]"):
             current_sec = line[1:-1].strip().lower()
-            if current_sec not in overrides:
-                overrides[current_sec] = {}
+            overrides.setdefault(current_sec, {})
         elif "=" in line:
             k, v = line.split("=", 1)
-            k = k.strip()
-            v = v.strip()
-            if current_sec not in overrides:
-                overrides[current_sec] = {}
-            overrides[current_sec][k] = v
+            overrides.setdefault(current_sec, {})[k.strip()] = v.strip()
+
+    if not overrides:
+        raise RuntimeError(f"配置文件覆盖层为空: {path}")
     return overrides
 
 
@@ -169,7 +154,7 @@ def merge_chrome_ini(base_text, overrides_dict):
             continue
 
         if current_section in overrides_dict and "=" in stripped and not stripped.startswith(";"):
-            k, v = stripped.split("=", 1)
+            k, _ = stripped.split("=", 1)
             k = k.strip()
             if k in overrides_dict[current_section]:
                 new_lines.append(f"{k}={overrides_dict[current_section][k]}")
@@ -184,7 +169,25 @@ def merge_chrome_ini(base_text, overrides_dict):
                 new_lines.append(f"{k}={v}")
                 applied_keys[current_section].add(k)
 
+    # 追加基线中不存在的新 section
+    for sec, kv in overrides_dict.items():
+        remaining = {k: v for k, v in kv.items() if k not in applied_keys[sec]}
+        if remaining:
+            new_lines.append("")
+            new_lines.append(f"[{sec}]")
+            for k, v in remaining.items():
+                new_lines.append(f"{k}={v}")
+
     return "\r\n".join(new_lines) + "\r\n"
+
+
+def read_win_ini_value(ini_path, section, key, default="__MISSING__"):
+    """调用 Windows 原生 GetPrivateProfileStringW 实测读取 INI，与 Chrome++ 实际行为完全一致。"""
+    buf = ctypes.create_unicode_buffer(4096)
+    ctypes.windll.kernel32.GetPrivateProfileStringW(
+        section, key, default, buf, len(buf), str(ini_path)
+    )
+    return buf.value
 
 
 def get_pe_imports(file_path):
@@ -194,8 +197,7 @@ def get_pe_imports(file_path):
     if data[:2] != b"MZ":
         return []
     e_lfanew = struct.unpack("<I", data[0x3C:0x40])[0]
-    pe_sig = data[e_lfanew : e_lfanew + 4]
-    if pe_sig != b"PE\x00\x00":
+    if data[e_lfanew : e_lfanew + 4] != b"PE\x00\x00":
         return []
     coff_header = data[e_lfanew + 4 : e_lfanew + 24]
     num_sections = struct.unpack("<H", coff_header[2:4])[0]
@@ -245,6 +247,20 @@ def get_pe_imports(file_path):
     return dlls
 
 
+def assert_pe_injected(exe_path, expected_min_count=None):
+    """严格断言 PE 导入表首位为 setdll 注入的 version.dll，避免被原生系统 VERSION.dll 误判通过。"""
+    imports = get_pe_imports(exe_path)
+    if not imports or imports[0].lower() != "version.dll":
+        raise RuntimeError(
+            f"PE 导入表校验失败：首位必须为注入的 version.dll，实际导入列表: {imports}"
+        )
+    if expected_min_count is not None and len(imports) < expected_min_count:
+        raise RuntimeError(
+            f"PE 导入表条目数量异常：期望至少 {expected_min_count} 项，实际: {imports}"
+        )
+    return imports
+
+
 def extract_with_7z(seven_zip, archive_path, output_dir):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     cmd = [seven_zip, "x", str(archive_path), f"-o{output_dir}", "-y"]
@@ -253,23 +269,34 @@ def extract_with_7z(seven_zip, archive_path, output_dir):
         raise RuntimeError(f"解压失败: {archive_path}\n{res.stdout}\n{res.stderr}")
 
 
-def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome_plus_url):
+def build(
+    chrome_version,
+    chrome_url,
+    chrome_sha256,
+    chrome_plus_version,
+    chrome_plus_url,
+    chrome_plus_sha256=None,
+    chrome_plus_size=None,
+):
     seven_zip = find_7z()
     print(f"[TOOL] 7-Zip 工具路径: {seven_zip}")
 
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-    token = get_github_token()
-
-    # 1. 下载文件
+    # 1. 下载文件并校验完整性
     installer_name = f"chrome_installer_{chrome_version}_x64.exe"
     installer_path = DOWNLOADS_DIR / installer_name
     download_file(chrome_url, installer_path, expected_sha256=chrome_sha256)
 
     plus_archive_name = f"setdll_{chrome_plus_version}.7z"
     plus_archive_path = DOWNLOADS_DIR / plus_archive_name
-    download_file(chrome_plus_url, plus_archive_path, token=token)
+    download_file(
+        chrome_plus_url,
+        plus_archive_path,
+        expected_sha256=chrome_plus_sha256,
+        expected_size=chrome_plus_size,
+    )
 
     with tempfile.TemporaryDirectory(prefix="chrome_build_", ignore_cleanup_errors=True) as temp_dir_str:
         temp_dir = Path(temp_dir_str)
@@ -283,12 +310,10 @@ def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome
         print("[EXTRACT] 正在解压 Chrome 离线安装程序...")
         extract_with_7z(seven_zip, installer_path, raw_extract)
 
-        # 检查是否直接解包出 Chrome-bin 或 chrome.exe（uncompressed 安装包）
         candidate_bin = list(raw_extract.rglob("Chrome-bin"))
         candidate_exe = list(raw_extract.rglob("chrome.exe"))
 
         if not candidate_bin and not candidate_exe:
-            # 寻找内部的 chrome.7z
             chrome_7z_list = list(raw_extract.rglob("chrome.7z")) + list(raw_extract.rglob("CHROME.7Z"))
             if chrome_7z_list:
                 chrome_7z = chrome_7z_list[0]
@@ -308,7 +333,7 @@ def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome
         chrome_app_dir.mkdir(parents=True, exist_ok=True)
         shutil.copytree(source_bin, chrome_app_dir, dirs_exist_ok=True)
 
-        # 4. 剔除冗余更新及遥测组件
+        # 3. 剔除冗余更新及遥测组件
         print("[CLEAN] 剔除 Google 更新与安装辅助程序...")
         removed_count = 0
         for item in chrome_app_dir.rglob("*"):
@@ -318,11 +343,10 @@ def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome
                 removed_count += 1
         print(f"[CLEAN] 共清除 {removed_count} 个冗余文件。")
 
-        # 5. 解压 Chrome++ 并集成
+        # 4. 解压 Chrome++ 并集成
         print("[EXTRACT] 正在解包 Chrome++ 插件...")
         extract_with_7z(seven_zip, plus_archive_path, plus_extract)
 
-        # 定位所需文件: version-x64.dll, setdll-x64.exe, chrome++.ini
         version_dll = next(plus_extract.rglob("version-x64.dll"), None)
         setdll_exe = next(plus_extract.rglob("setdll-x64.exe"), None)
         base_ini = next(plus_extract.rglob("chrome++.ini"), None)
@@ -330,14 +354,12 @@ def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome
         if not version_dll or not setdll_exe or not base_ini:
             raise RuntimeError("setdll.7z 中缺少必要的 version-x64.dll, setdll-x64.exe 或 chrome++.ini")
 
-        # 复制 version-x64.dll 到 Chrome 根目录命名为 version.dll
         target_version_dll = chrome_app_dir / "version.dll"
         shutil.copy2(version_dll, target_version_dll)
         print(f"[INTEGRATE] 已放置插件 DLL: {target_version_dll.name}")
 
-        # 6. 配置合并 (chrome++.ini)
-        print("[CONFIG] 正在合并 Chrome++ 配置文件 (含强制开启 ignore_policies)...")
-        # 尝试解码原始 ini
+        # 5. 配置合并 (单一事实来源：以 chrome++.override.ini 为准，写入带 BOM 的 UTF-16LE)
+        print("[CONFIG] 正在合并 Chrome++ 配置文件...")
         ini_raw = base_ini.read_bytes()
         ini_text = None
         for enc in ("utf-16", "utf-16-le", "utf-8-sig", "utf-8", "gbk"):
@@ -349,29 +371,23 @@ def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome
         if not ini_text:
             ini_text = ini_raw.decode("latin1")
 
-        # 读取本地 override.ini
         override_file = REPO_ROOT / "chrome++" / "chrome++.override.ini"
         overrides = parse_ini_overrides(override_file)
 
-        # 强制确保核心配置
-        if "general" not in overrides:
-            overrides["general"] = {}
-        overrides["general"]["data_dir"] = r"%app%\..\Data"
-        overrides["general"]["cache_dir"] = r"%app%\..\Cache"
-        overrides["general"]["ignore_policies"] = "1"  # 用户明确要求默认开启
-
         merged_ini_text = merge_chrome_ini(ini_text, overrides)
         target_ini = chrome_app_dir / "chrome++.ini"
-        target_ini.write_text(merged_ini_text, encoding="utf-16-le")
-        print(f"[CONFIG] 配置文件写入完成: {target_ini.name} (UTF-16LE with ignore_policies=1)")
+        # 显式写入 FF FE (UTF-16LE BOM)，与上游基线及 Windows API 规范完全一致
+        target_ini.write_bytes(b"\xff\xfe" + merged_ini_text.encode("utf-16-le"))
+        print(f"[CONFIG] 配置文件写入完成: {target_ini.name} (UTF-16LE with BOM)")
 
-        # 7. PE 注入 (向 chrome.exe 注入 version.dll)
+        # 6. PE 注入 (注入前后严格对比导入表)
         chrome_exe = chrome_app_dir / "chrome.exe"
         if not chrome_exe.exists():
             raise RuntimeError(f"目标程序不存在: {chrome_exe}")
 
-        print(f"[PE INJECT] 正在使用 setdll 注入 version.dll 到 {chrome_exe.name} ...")
-        # 复制 setdll-x64.exe 到临时目录执行注入
+        imports_before = get_pe_imports(chrome_exe)
+        print(f"[PE INJECT] 注入前导入表 ({len(imports_before)} 项): {imports_before}")
+
         temp_setdll = temp_dir / "setdll-x64.exe"
         shutil.copy2(setdll_exe, temp_setdll)
 
@@ -381,24 +397,21 @@ def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome
             print(res.stdout)
             print(res.stderr, file=sys.stderr)
             raise RuntimeError(f"setdll PE 注入失败，退出码: {res.returncode}")
-        print("[PE INJECT] setdll 执行成功。")
 
-        # 8. 校验 PE 导入表
-        print("[VERIFY] 校验 chrome.exe PE 导入表...")
-        imports = get_pe_imports(chrome_exe)
-        imports_lower = [i.lower() for i in imports]
-        if "version.dll" not in imports_lower:
-            raise RuntimeError(f"校验失败：chrome.exe 导入表中未检测到 version.dll！当前导入列表: {imports}")
-        print(f"[VERIFY] 导入表校验通过，检测到 version.dll (首选注入 DLL)")
+        imports_after = assert_pe_injected(chrome_exe, expected_min_count=len(imports_before) + 1)
+        print(f"[VERIFY] 注入后导入表 ({len(imports_after)} 项): {imports_after}")
 
-        # 9. 放置快捷方式辅助脚本 开始.bat
+        # 7. 放置快捷方式辅助脚本 开始.bat（强制确保 CRLF，避免 cmd.exe + chcp 65001 在 LF 下错位）
         start_bat_src = REPO_ROOT / "开始.bat"
-        if start_bat_src.exists():
-            shutil.copy2(start_bat_src, stage_dir / "开始.bat")
-            print("[PACKAGE] 已添加 开始.bat 到压缩包根目录")
+        if not start_bat_src.exists():
+            raise FileNotFoundError(f"未找到启动脚本: {start_bat_src}")
+        bat_text = start_bat_src.read_text(encoding="utf-8-sig")
+        bat_crlf = bat_text.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8")
+        (stage_dir / "开始.bat").write_bytes(bat_crlf)
+        print("[PACKAGE] 已添加 开始.bat 到压缩包根目录 (CRLF)")
 
-        # 10. 压缩生成便携版 7z 包
-        archive_name = f"Chrome++_{chrome_version}_{chrome_plus_version}_x64.7z"
+        # 8. 压缩生成便携版 7z 包
+        archive_name = archive_filename(chrome_version, chrome_plus_version)
         archive_path = ASSETS_DIR / archive_name
         if archive_path.exists():
             archive_path.unlink()
@@ -422,34 +435,66 @@ def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome
         archive_sha256 = calc_sha256(archive_path)
         print(f"[COMPRESS] 打包完成！大小: {archive_size // (1024*1024)} MB, SHA256: {archive_sha256}")
 
-        # 生成 .sha256 校验文件
         sha256_file = ASSETS_DIR / f"{archive_name}.sha256"
         sha256_file.write_text(f"{archive_sha256}  {archive_name}\n", encoding="utf-8")
         print(f"[CHECKSUM] 已生成校验文件: {sha256_file.name}")
 
-        # 11. 全方位自测验证
-        print("\n=== [全方位自测验证 (Smoke Test)] ===")
-        test_extract_dir = temp_dir / "test_extract"
+        # 9. 全方位闭环自测验证（含单引号与空格路径、BOM/Windows API 读配置、PE 首位注入、开始.bat 与运行时便携目录生成）
+        print("\n=== [全方位闭环自测验证 (Smoke Test)] ===")
+        test_extract_dir = temp_dir / "Bob's Chrome Test"
         extract_with_7z(seven_zip, archive_path, test_extract_dir)
         test_chrome_exe = test_extract_dir / "Chrome" / "chrome.exe"
         test_version_dll = test_extract_dir / "Chrome" / "version.dll"
         test_ini = test_extract_dir / "Chrome" / "chrome++.ini"
         test_bat = test_extract_dir / "开始.bat"
 
-        assert test_chrome_exe.exists(), "自检失败: Chrome/chrome.exe 缺失"
-        assert test_version_dll.exists(), "自检失败: Chrome/version.dll 缺失"
-        assert test_ini.exists(), "自检失败: Chrome/chrome++.ini 缺失"
-        assert test_bat.exists(), "自检失败: 开始.bat 缺失"
+        for required in (test_chrome_exe, test_version_dll, test_ini, test_bat):
+            if not required.exists():
+                raise RuntimeError(f"自检失败: 关键文件缺失 -> {required}")
 
-        # 验证解压后 PE 导入
-        test_imports = [i.lower() for i in get_pe_imports(test_chrome_exe)]
-        assert "version.dll" in test_imports, "自检失败: 解压后 chrome.exe 未包含 version.dll 导入"
+        # 9.1 验证解压后 PE 导入表首位注入
+        assert_pe_injected(test_chrome_exe, expected_min_count=len(imports_before) + 1)
+        print("[TEST 1/4] PE 首位注入校验通过。")
 
-        # 验证 ini 中的 ignore_policies=1
-        ini_readback = test_ini.read_bytes().decode("utf-16-le")
-        assert "ignore_policies=1" in ini_readback, "自检失败: chrome++.ini 未包含 ignore_policies=1"
+        # 9.2 验证 BOM 头与 Windows 原生 API 读取所有 override 配置项
+        if not test_ini.read_bytes().startswith(b"\xff\xfe"):
+            raise RuntimeError("自检失败: chrome++.ini 缺少 UTF-16LE BOM 头 (FF FE)")
+        for sec, kv in overrides.items():
+            for k, expected_v in kv.items():
+                actual_v = read_win_ini_value(test_ini, sec, k)
+                if actual_v != expected_v:
+                    raise RuntimeError(
+                        f"自检失败: Windows API 读取 [{sec}] {k} 不匹配！期望={expected_v!r}, 实际={actual_v!r}"
+                    )
+        print("[TEST 2/4] UTF-16LE BOM 及 Windows 原生 INI API 实测校验通过。")
 
-        print("[SMOKE TEST] 尝试 Headless 启动解压后的 chrome.exe 验证运行...")
+        # 9.3 实测含单引号与空格路径下的 开始.bat 快捷方式生成
+        bat_res = subprocess.run(
+            ["cmd", "/c", str(test_bat)],
+            cwd=str(test_extract_dir),
+            input="\n",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        test_lnk = test_extract_dir / "Chrome.lnk"
+        if bat_res.returncode != 0 or not test_lnk.exists():
+            raise RuntimeError(
+                f"自检失败: 开始.bat 在含特殊字符路径下执行失败 (code={bat_res.returncode})\n{bat_res.stdout}\n{bat_res.stderr}"
+            )
+        print(f"[TEST 3/4] 开始.bat 快捷方式生成验证通过（含单引号/空格路径: {test_extract_dir.name}）。")
+
+        # 9.4 实测 Headless 启动并验证 Chrome++ 便携数据/缓存目录生效
+        # Chrome++ 会由父进程拉起带 --portable / --user-data-dir / --disk-cache-dir 的子进程后立即 ExitProcess(0)
+        test_data_dir = test_extract_dir / "Data"
+        test_cache_dir = test_extract_dir / "Cache"
+        for p in (test_data_dir, test_cache_dir):
+            if p.exists():
+                shutil.rmtree(p)
+
+        print("[TEST 4/4] 启动解压后的 chrome.exe 验证运行时注入与便携数据隔离...")
         smoke_cmd = [
             str(test_chrome_exe),
             "--headless=new",
@@ -457,15 +502,25 @@ def build(chrome_version, chrome_url, chrome_sha256, chrome_plus_version, chrome
             "--disable-gpu",
             "about:blank",
         ]
-        try:
-            smoke_res = subprocess.run(smoke_cmd, capture_output=True, text=True, timeout=15)
-            print(f"[SMOKE TEST] Headless 启动正常退出 (code={smoke_res.returncode})")
-        except subprocess.TimeoutExpired:
-            print("[SMOKE TEST] Headless 启动超时，尝试非阻塞验证。")
-        except Exception as e:
-            print(f"[SMOKE TEST WARN] Headless 启动异常: {e}")
+        smoke_res = subprocess.run(smoke_cmd, capture_output=True, text=True, timeout=30)
+        if smoke_res.returncode != 0:
+            raise RuntimeError(
+                f"自检失败: Headless 启动返回非 0 退出码 ({smoke_res.returncode})\n{smoke_res.stderr}"
+            )
 
-        print("=== 自测全部通过，产物准备就绪！===\n")
+        # 轮询等待 Chrome++ 拉起的子进程创建便携 Data 与 Cache 目录
+        for _ in range(20):
+            if test_data_dir.is_dir() and test_cache_dir.is_dir():
+                break
+            time.sleep(0.5)
+
+        if not test_data_dir.is_dir() or not test_cache_dir.is_dir():
+            raise RuntimeError(
+                f"自检失败: 启动后未在便携路径生成 Data/Cache 目录 ({test_extract_dir})，Chrome++ 可能未生效！"
+            )
+        print("[TEST 4/4] Headless 启动正常 (code=0)，已确认便携目录生成: Data/ 与 Cache/")
+        print("=== 全方位闭环自测全部通过，产物准备就绪！===\n")
+
         time.sleep(1)
         return {
             "archive_name": archive_name,
@@ -483,9 +538,10 @@ def main():
     parser.add_argument("--chrome-sha256", help="Chrome installer expected SHA256")
     parser.add_argument("--plus-version", help="Chrome++ version (e.g. 1.20.1)")
     parser.add_argument("--plus-url", help="Chrome++ setdll.7z download URL")
+    parser.add_argument("--plus-sha256", help="Chrome++ setdll.7z expected SHA256")
+    parser.add_argument("--plus-size", type=int, help="Chrome++ setdll.7z expected size")
     args = parser.parse_args()
 
-    # 如果未传递参数，则自动调用 check_update 获取最新信息
     if not args.chrome_version or not args.chrome_url or not args.plus_version or not args.plus_url:
         print("[INFO] 未指定版本参数，自动检测最新版本...")
         from check_update import get_latest_chrome, get_latest_chrome_plus
@@ -497,16 +553,27 @@ def main():
         chrome_sha256 = chrome["sha256"]
         plus_version = plus["version"]
         plus_url = plus["url"]
+        plus_sha256 = plus.get("sha256")
+        plus_size = plus.get("size")
     else:
         chrome_version = args.chrome_version
         chrome_url = args.chrome_url
         chrome_sha256 = args.chrome_sha256
         plus_version = args.plus_version
         plus_url = args.plus_url
+        plus_sha256 = args.plus_sha256
+        plus_size = args.plus_size
 
-    res = build(chrome_version, chrome_url, chrome_sha256, plus_version, plus_url)
+    res = build(
+        chrome_version,
+        chrome_url,
+        chrome_sha256,
+        plus_version,
+        plus_url,
+        chrome_plus_sha256=plus_sha256,
+        chrome_plus_size=plus_size,
+    )
 
-    # 导出到 GITHUB_ENV
     env_file = os.environ.get("GITHUB_ENV")
     if env_file:
         with open(env_file, "a", encoding="utf-8") as f:

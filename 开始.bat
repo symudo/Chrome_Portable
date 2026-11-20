@@ -1,7 +1,9 @@
 @echo off
 chcp 65001 >nul
+setlocal
 
-set "APP_DIR=%~dp0Chrome"
+set "WORK_DIR=%~dp0"
+set "APP_DIR=%WORK_DIR%Chrome"
 set "CHROME_EXE="
 
 if exist "%APP_DIR%\chrome.exe" (
@@ -22,9 +24,10 @@ pause
 exit /b 1
 
 :found
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut('%~dp0Chrome.lnk'); $l.TargetPath='%CHROME_EXE%'; $l.Arguments=''; $l.WorkingDirectory='%~dp0'; $l.IconLocation='%CHROME_EXE%,0'; $l.Save()"
+set "LNK_PATH=%WORK_DIR%Chrome.lnk"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = New-Object -ComObject WScript.Shell; $l = $s.CreateShortcut($env:LNK_PATH); $l.TargetPath = $env:CHROME_EXE; $l.Arguments = ''; $l.WorkingDirectory = $env:WORK_DIR; $l.IconLocation = $env:CHROME_EXE + ',0'; $l.Save()"
 
-if exist "%~dp0Chrome.lnk" (
+if exist "%LNK_PATH%" (
     echo 快捷方式创建成功
     echo 指向：%CHROME_EXE%
     exit /b 0

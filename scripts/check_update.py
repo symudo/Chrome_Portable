@@ -9,42 +9,24 @@
 import argparse
 import json
 import os
-import subprocess
 import sys
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+from common import (
+    DEFAULT_REPO,
+    archive_filename,
+    configure_utf8_stdio,
+    get_github_token,
+    urlopen_with_retry,
+)
+
+configure_utf8_stdio()
 
 GOOGLE_OMAHA_URL = "https://tools.google.com/service/update2"
 BUSH_INSTALLER_DATA_URL = "https://raw.githubusercontent.com/Bush2021/chrome_installer/main/data.json"
 CHROME_PLUS_API_URL = "https://api.github.com/repos/Bush2021/chrome_plus/releases/latest"
-
-DEFAULT_REPO = "symudo/Chrome_Portable"
-
-
-def get_github_token():
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        return token
-    try:
-        proc = subprocess.run(
-            ["git", "credential", "fill"],
-            input="protocol=https\nhost=github.com\n",
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-        )
-        for line in proc.stdout.splitlines():
-            if line.startswith("password="):
-                return line.split("=", 1)[1]
-    except Exception:
-        pass
-    return None
 
 
 def github_request(url, token=None):
@@ -57,7 +39,7 @@ def github_request(url, token=None):
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urlopen_with_retry(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -76,7 +58,7 @@ def get_latest_chrome_from_omaha():
         data=body.encode("utf-8"),
         headers={"Content-Type": "text/xml", "User-Agent": "Google Update/1.3.36.372"},
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urlopen_with_retry(req, timeout=30) as resp:
         res = resp.read().decode("utf-8")
         root = ET.fromstring(res)
         app = root.find("app")
@@ -97,14 +79,10 @@ def get_latest_chrome_from_omaha():
             u.attrib.get("codebase") + pkg_name
             for u in updatecheck.find("urls").findall("url")
         ]
-        # Prefer HTTPS google.com URL if available
-        chosen_url = None
-        for u in urls:
-            if u.startswith("https://") and "google.com" in u:
-                chosen_url = u
-                break
-        if not chosen_url:
-            chosen_url = urls[0] if urls else ""
+        chosen_url = next(
+            (u for u in urls if u.startswith("https://") and "google.com" in u),
+            urls[0] if urls else "",
+        )
 
         return {
             "version": version,
@@ -119,17 +97,16 @@ def get_latest_chrome_fallback():
         BUSH_INSTALLER_DATA_URL,
         headers={"User-Agent": "ChromePortableChecker"},
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urlopen_with_retry(req, timeout=30) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         entry = data.get("win_stable_x64")
         if not entry:
             raise RuntimeError("No win_stable_x64 in Bush2021 data.json")
         urls = entry.get("urls", [])
-        chosen_url = urls[0] if urls else ""
-        for u in urls:
-            if u.startswith("https://") and "google.com" in u:
-                chosen_url = u
-                break
+        chosen_url = next(
+            (u for u in urls if u.startswith("https://") and "google.com" in u),
+            urls[0] if urls else "",
+        )
         return {
             "version": entry.get("version"),
             "url": chosen_url,
@@ -153,21 +130,28 @@ def get_latest_chrome_plus():
     setdll_asset = next((a for a in assets if a.get("name") == "setdll.7z"), None)
     if not setdll_asset:
         raise RuntimeError(f"setdll.7z not found in chrome_plus {tag}")
+
+    digest = setdll_asset.get("digest") or ""
+    sha256 = digest.split(":", 1)[1].lower() if digest.lower().startswith("sha256:") else ""
+
     return {
         "version": tag,
         "url": setdll_asset.get("browser_download_url"),
-        "size": setdll_asset.get("size", 0),
+        "size": int(setdll_asset.get("size", 0)),
+        "sha256": sha256,
     }
 
 
-def check_tag_exists(repo, tag, token=None):
+def check_tag_exists(repo, tag, expected_asset=None, token=None):
     url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
     try:
         data = github_request(url, token=token)
-        # Verify that it actually has assets attached
+        if data.get("draft"):
+            return False
         assets = data.get("assets", [])
-        has_7z = any(a.get("name", "").endswith(".7z") for a in assets)
-        return has_7z
+        if expected_asset:
+            return any(a.get("name") == expected_asset for a in assets)
+        return any(a.get("name", "").endswith(".7z") for a in assets)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return False
@@ -199,14 +183,16 @@ def main():
     plus_info = get_latest_chrome_plus()
     print(f"Chrome++ 最新版: {plus_info['version']}")
     print(f"插件包下载直链: {plus_info['url']}")
+    print(f"插件包大小: {plus_info['size']} 字节, SHA256: {plus_info['sha256'] or '(未提供)'}")
 
     release_tag = f"v{chrome_info['version']}-{plus_info['version']}"
-    release_title = f"Chrome++ v{chrome_info['version']} (插件 {plus_info['version']})"
+    release_title = f"Chrome Portable v{chrome_info['version']} (Chrome++ {plus_info['version']})"
+    expected_archive = archive_filename(chrome_info["version"], plus_info["version"])
 
     print(f"\n=== [3/3] 检查目标仓库 Release 状态 ({args.repo}) ===")
-    print(f"目标 Tag: {release_tag}")
+    print(f"目标 Tag: {release_tag}, 目标产物: {expected_archive}")
 
-    already_released = check_tag_exists(args.repo, release_tag)
+    already_released = check_tag_exists(args.repo, release_tag, expected_asset=expected_archive)
     if args.force:
         print("[INFO] 强制触发构建模式已开启 (--force)")
         update_needed = True
@@ -214,9 +200,9 @@ def main():
         update_needed = not already_released
 
     if update_needed:
-        print(f"[RESULT] 检测到更新！需要打包发布 (Tag {release_tag} 尚未发布或强制触发)")
+        print(f"[RESULT] 检测到更新！需要打包发布 (Tag {release_tag} 或目标资产尚未发布，或强制触发)")
     else:
-        print(f"[RESULT] 当前已是最新版本 (Tag {release_tag} 已存在)，无需重新打包。")
+        print(f"[RESULT] 当前已是最新版本 (Tag {release_tag} 与资产已存在)，无需重新打包。")
 
     result = {
         "update_needed": str(update_needed).lower(),
@@ -226,6 +212,8 @@ def main():
         "chrome_size": str(chrome_info["size"]),
         "chrome_plus_version": plus_info["version"],
         "chrome_plus_url": plus_info["url"],
+        "chrome_plus_size": str(plus_info["size"]),
+        "chrome_plus_sha256": plus_info["sha256"],
         "release_tag": release_tag,
         "release_title": release_title,
     }

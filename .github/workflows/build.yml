@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: 'Force build even if already released'
+        description: 'Force build and republish even if already released'
         required: false
         type: boolean
         default: false
@@ -40,14 +40,16 @@ jobs:
       chrome_size: ${{ steps.check.outputs.chrome_size }}
       chrome_plus_version: ${{ steps.check.outputs.chrome_plus_version }}
       chrome_plus_url: ${{ steps.check.outputs.chrome_plus_url }}
+      chrome_plus_size: ${{ steps.check.outputs.chrome_plus_size }}
+      chrome_plus_sha256: ${{ steps.check.outputs.chrome_plus_sha256 }}
       release_tag: ${{ steps.check.outputs.release_tag }}
       release_title: ${{ steps.check.outputs.release_title }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
@@ -75,37 +77,51 @@ jobs:
   build:
     name: Build & Release
     needs: check
-    if: github.event_name != 'schedule' || needs.check.outputs.update_needed == 'true'
+    if: needs.check.outputs.update_needed == 'true' || github.event_name == 'push'
     runs-on: windows-latest
     permissions:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
-      - name: Build portable package
+      - name: Build & verify portable package
         id: build
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHROME_VERSION: ${{ needs.check.outputs.chrome_version }}
+          CHROME_URL: ${{ needs.check.outputs.chrome_url }}
+          CHROME_SHA256: ${{ needs.check.outputs.chrome_sha256 }}
+          PLUS_VERSION: ${{ needs.check.outputs.chrome_plus_version }}
+          PLUS_URL: ${{ needs.check.outputs.chrome_plus_url }}
+          PLUS_SIZE: ${{ needs.check.outputs.chrome_plus_size }}
+          PLUS_SHA256: ${{ needs.check.outputs.chrome_plus_sha256 }}
         run: |
-          python scripts/build_portable.py `
-            --chrome-version "${{ needs.check.outputs.chrome_version }}" `
-            --chrome-url "${{ needs.check.outputs.chrome_url }}" `
-            --chrome-sha256 "${{ needs.check.outputs.chrome_sha256 }}" `
-            --plus-version "${{ needs.check.outputs.chrome_plus_version }}" `
-            --plus-url "${{ needs.check.outputs.chrome_plus_url }}"
+          $argsList = @(
+            "scripts/build_portable.py",
+            "--chrome-version", $env:CHROME_VERSION,
+            "--chrome-url", $env:CHROME_URL,
+            "--chrome-sha256", $env:CHROME_SHA256,
+            "--plus-version", $env:PLUS_VERSION,
+            "--plus-url", $env:PLUS_URL
+          )
+          if ($env:PLUS_SHA256) { $argsList += @("--plus-sha256", $env:PLUS_SHA256) }
+          if ($env:PLUS_SIZE)   { $argsList += @("--plus-size", $env:PLUS_SIZE) }
+          python @argsList
 
       - name: Publish to GitHub Releases
-        if: needs.check.outputs.update_needed == 'true' || inputs.force == true
+        if: needs.check.outputs.update_needed == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHROME_VERSION: ${{ needs.check.outputs.chrome_version }}
+          PLUS_VERSION: ${{ needs.check.outputs.chrome_plus_version }}
         run: |
           python scripts/release_helper.py `
-            --chrome-version "${{ needs.check.outputs.chrome_version }}" `
-            --plus-version "${{ needs.check.outputs.chrome_plus_version }}" `
+            --chrome-version $env:CHROME_VERSION `
+            --plus-version $env:PLUS_VERSION `
             --archive-path "build/assets/$env:ARCHIVE_NAME"

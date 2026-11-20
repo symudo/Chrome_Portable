@@ -1,48 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GitHub Release 发布辅助脚本
-自动创建或更新 Release，渲染发布说明，并上传 .7z 与 .sha256 产物文件。
+GitHub Release 原子发布辅助脚本
+采用“先草稿 → 交叉校验哈希 → 流式上传资产 → 正式公开”的原子发布流程，杜绝空 Release 窗口。
 """
 
 import argparse
 import datetime
 import json
 import os
-import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+from common import (
+    DEFAULT_REPO,
+    calc_sha256,
+    configure_utf8_stdio,
+    get_github_token,
+    urlopen_with_retry,
+)
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_REPO = "symudo/Chrome_Portable"
-
-
-def get_github_token():
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        return token
-    try:
-        proc = subprocess.run(
-            ["git", "credential", "fill"],
-            input="protocol=https\nhost=github.com\n",
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-        )
-        for line in proc.stdout.splitlines():
-            if line.startswith("password="):
-                return line.split("=", 1)[1]
-    except Exception:
-        pass
-    return None
+configure_utf8_stdio()
 
 
 def format_size(bytes_num):
@@ -55,10 +36,10 @@ def format_size(bytes_num):
 
 def render_release_body(chrome_version, plus_version, archive_name, archive_size, archive_sha256):
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    body = f"""自动构建的 Google Chrome 64位 Windows 便携版，集成 [Chrome++] 增强插件。
+    return f"""自动构建的 Google Chrome 64位 Windows 便携版，集成 [Chrome++](https://github.com/Bush2021/chrome_plus) 增强插件。
 
 > **安装与使用说明**：
-> - 解压至任意目录，双击 `开始.bat` 即可在解压根目录生成桌面/本地快捷方式 `Chrome.lnk`。
+> - 解压至任意目录，双击 `开始.bat` 即可在解压根目录生成本地快捷方式 `Chrome.lnk`。
 > - 用户数据默认隔离保存在 `Chrome` 同级的 `Data` 与 `Cache` 文件夹，随目录整体移动，绿色便携。
 > - 插件已默认开启 **禁止从注册表读取企业版策略**（`ignore_policies=1`）。
 > - 已移除 `GoogleUpdate` 等常驻后台及自动更新组件。
@@ -86,40 +67,57 @@ def render_release_body(chrome_version, plus_version, archive_name, archive_size
 - Chrome++ 插件源：[Bush2021/chrome_plus](https://github.com/Bush2021/chrome_plus)
 - 架构参考：[Piracola/Chrome-Portable](https://github.com/Piracola/Chrome-Portable)
 """
-    return body
 
 
-def create_or_get_release(repo, tag, title, body, token):
-    headers = {
+def _github_headers(token):
+    return {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "User-Agent": "ChromePortableReleaseHelper",
     }
-    # 检查是否已存在
+
+
+def find_existing_release(repo, tag, token):
+    """查找已发布的同 tag Release，或同 tag_name 的草稿 Release。"""
+    headers = _github_headers(token)
     get_url = f"https://api.github.com/repos/{repo}/releases/tags/{tag}"
-    req = urllib.request.Request(get_url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            print(f"[RELEASE] 发现已存在的 Release: {data.get('html_url')}")
-            # 更新 body 和 title
-            update_url = f"https://api.github.com/repos/{repo}/releases/{data['id']}"
-            update_data = json.dumps({"name": title, "body": body}).encode("utf-8")
-            update_req = urllib.request.Request(update_url, data=update_data, headers=headers, method="PATCH")
-            with urllib.request.urlopen(update_req, timeout=30) as u_resp:
-                return json.loads(u_resp.read().decode("utf-8"))
+        req = urllib.request.Request(get_url, headers=headers)
+        with urlopen_with_retry(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code != 404:
             raise
 
-    # 不存在则创建
-    print(f"[RELEASE] 正在创建新 Release: {tag} - {title} ...")
+    # 已发布接口查不到 draft，遍历近期 releases 复用未完成的同 tag 草稿
+    list_url = f"https://api.github.com/repos/{repo}/releases?per_page=30"
+    req = urllib.request.Request(list_url, headers=headers)
+    with urlopen_with_retry(req, timeout=30) as resp:
+        for rel in json.loads(resp.read().decode("utf-8")):
+            if rel.get("tag_name") == tag:
+                return rel
+    return None
+
+
+def prepare_release(repo, tag, title, body, token):
+    """若存在则更新元数据；若不存在则先创建 draft=True 草稿，等待资产上传完成后再公开。"""
+    headers = _github_headers(token)
+    existing = find_existing_release(repo, tag, token)
+    if existing:
+        print(f"[RELEASE] 发现已存在的 Release (draft={existing.get('draft')}): {existing.get('html_url')}")
+        update_url = f"https://api.github.com/repos/{repo}/releases/{existing['id']}"
+        update_data = json.dumps({"name": title, "body": body}).encode("utf-8")
+        update_req = urllib.request.Request(update_url, data=update_data, headers=headers, method="PATCH")
+        with urlopen_with_retry(update_req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    print(f"[RELEASE] 正在创建草稿 Release: {tag} - {title} ...")
     create_url = f"https://api.github.com/repos/{repo}/releases"
     payload = {
         "tag_name": tag,
         "name": title,
         "body": body,
-        "draft": False,
+        "draft": True,
         "prerelease": False,
     }
     create_req = urllib.request.Request(
@@ -128,38 +126,80 @@ def create_or_get_release(repo, tag, title, body, token):
         headers=headers,
         method="POST",
     )
-    with urllib.request.urlopen(create_req, timeout=30) as resp:
+    with urlopen_with_retry(create_req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def upload_asset(upload_url_template, file_path, token):
+def publish_draft_release(repo, release_id, token):
+    """将草稿 Release 翻转为正式公开状态。"""
+    headers = _github_headers(token)
+    url = f"https://api.github.com/repos/{repo}/releases/{release_id}"
+    payload = json.dumps({"draft": False}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers=headers, method="PATCH")
+    with urlopen_with_retry(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def upload_asset_streaming(upload_url_template, file_path, token, retries=3):
+    """流式上传大文件资产（避免一次性读入内存），支持失败重试。"""
     file_path = Path(file_path)
     if not file_path.exists():
         raise FileNotFoundError(f"文件不存在: {file_path}")
 
-    # upload_url_template 通常形如 "https://uploads.github.com/repos/.../assets{?name,label}"
     base_upload_url = upload_url_template.split("{")[0]
     encoded_name = urllib.parse.quote(file_path.name)
     upload_url = f"{base_upload_url}?name={encoded_name}"
 
+    file_size = file_path.stat().st_size
     content_type = "application/x-7z-compressed" if file_path.suffix == ".7z" else "text/plain"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": content_type,
+        "Content-Length": str(file_size),
         "User-Agent": "ChromePortableReleaseHelper",
     }
 
-    file_bytes = file_path.read_bytes()
-    req = urllib.request.Request(upload_url, data=file_bytes, headers=headers, method="POST")
-    print(f"[UPLOAD] 正在上传资产: {file_path.name} ({len(file_bytes) // (1024*1024)} MB) ...")
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        res = json.loads(resp.read().decode("utf-8"))
-        print(f"[UPLOAD] 资产上传成功: {res.get('browser_download_url')}")
-        return res
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            print(f"[UPLOAD] 正在流式上传资产: {file_path.name} ({format_size(file_size)}) [第 {attempt}/{retries} 次] ...")
+            with open(file_path, "rb") as f:
+                req = urllib.request.Request(upload_url, data=f, headers=headers, method="POST")
+                with urlopen_with_retry(req, timeout=600, retries=1) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+                    print(f"[UPLOAD] 资产上传成功: {res.get('browser_download_url')}")
+                    return res
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                import time
+                wait = 3 * attempt
+                print(f"[RETRY] 上传失败 ({e})，{wait}s 后重试...", file=sys.stderr)
+                time.sleep(wait)
+    raise last_err
+
+
+def verify_sha256_sidecar(archive_path, sha256_path):
+    """分块流式计算归档 SHA256，并与 .sha256 校验文件做严格交叉核验。"""
+    actual_sha = calc_sha256(archive_path)
+    sidecar_content = sha256_path.read_text(encoding="utf-8").strip()
+    parts = sidecar_content.split()
+    if len(parts) < 2:
+        raise RuntimeError(f".sha256 文件格式无效: {sidecar_content!r}")
+    sidecar_sha, sidecar_name = parts[0].lower(), parts[-1]
+    if sidecar_sha != actual_sha:
+        raise RuntimeError(
+            f"SHA256 交叉校验失败！归档实际={actual_sha}，.sha256 记录={sidecar_sha}"
+        )
+    if sidecar_name != archive_path.name:
+        raise RuntimeError(
+            f".sha256 文件名不匹配！归档={archive_path.name}，.sha256 记录={sidecar_name}"
+        )
+    return actual_sha
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Publish Chrome Portable release to GitHub.")
+    parser = argparse.ArgumentParser(description="Publish Chrome Portable release to GitHub atomically.")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", DEFAULT_REPO), help="Target GitHub repo")
     parser.add_argument("--chrome-version", required=True, help="Chrome version")
     parser.add_argument("--plus-version", required=True, help="Chrome++ version")
@@ -178,48 +218,39 @@ def main():
     if not sha256_path.exists():
         raise FileNotFoundError(f"未找到 sha256 校验文件: {sha256_path}")
 
-    import hashlib
     archive_size = archive_path.stat().st_size
-    sha256_text = hashlib.sha256(archive_path.read_bytes()).hexdigest().lower()
+    sha256_text = verify_sha256_sidecar(archive_path, sha256_path)
+    print(f"[CHECKSUM] 归档与 .sha256 交叉校验通过: {sha256_text}")
 
     tag = f"v{args.chrome_version}-{args.plus_version}"
-    title = f"Chrome++ v{args.chrome_version} (插件 {args.plus_version})"
+    title = f"Chrome Portable v{args.chrome_version} (Chrome++ {args.plus_version})"
     body = render_release_body(args.chrome_version, args.plus_version, archive_path.name, archive_size, sha256_text)
 
-    # 1. 创建 Release
-    release_data = create_or_get_release(args.repo, tag, title, body, token)
+    # 1. 创建草稿或获取已有 Release
+    release_data = prepare_release(args.repo, tag, title, body, token)
     release_id = release_data["id"]
     upload_url = release_data["upload_url"]
 
-    # 2. 删除已有同名资产（如果存在）
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {token}",
-        "User-Agent": "ChromePortableReleaseHelper",
-    }
-    existing_assets = release_data.get("assets", [])
-    target_names = {
-        archive_path.name,
-        sha256_path.name,
-        archive_path.name.replace("++", " "),
-        archive_path.name.replace("++", "."),
-        sha256_path.name.replace("++", " "),
-        sha256_path.name.replace("++", "."),
-    }
-    for asset in existing_assets:
-        if asset.get("name") in target_names or asset.get("name", "").startswith("Chrome"):
-            print(f"[ASSET] 发现旧资产 {asset.get('name')}，正在删除...")
+    # 2. 仅精确删除与本次上传完全同名的旧资产，不误伤其他架构/文件
+    headers = _github_headers(token)
+    target_names = {archive_path.name, sha256_path.name}
+    for asset in release_data.get("assets", []):
+        if asset.get("name") in target_names:
+            print(f"[ASSET] 删除同名旧资产: {asset.get('name')} ...")
             del_req = urllib.request.Request(asset["url"], headers=headers, method="DELETE")
-            try:
-                urllib.request.urlopen(del_req, timeout=30)
-            except Exception as e:
-                print(f"[WARN] 删除旧资产失败: {e}")
+            with urlopen_with_retry(del_req, timeout=30):
+                pass
 
-    # 3. 上传新资产
-    upload_asset(upload_url, archive_path, token)
-    upload_asset(upload_url, sha256_path, token)
+    # 3. 流式上传资产
+    upload_asset_streaming(upload_url, archive_path, token)
+    upload_asset_streaming(upload_url, sha256_path, token)
 
-    print(f"\n[SUCCESS] 发布成功！访问地址: {release_data.get('html_url')}")
+    # 4. 若为草稿，全部上传成功后再正式公开
+    if release_data.get("draft"):
+        print("[RELEASE] 所有资产上传完毕，正在将草稿转为正式发布...")
+        release_data = publish_draft_release(args.repo, release_id, token)
+
+    print(f"\n[SUCCESS] 原子发布成功！访问地址: {release_data.get('html_url')}")
 
 
 if __name__ == "__main__":
