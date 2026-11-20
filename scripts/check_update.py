@@ -14,6 +14,11 @@ import sys
 import urllib.request
 import xml.etree.ElementTree as ET
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 GOOGLE_OMAHA_URL = "https://tools.google.com/service/update2"
 BUSH_INSTALLER_DATA_URL = "https://raw.githubusercontent.com/Bush2021/chrome_installer/main/data.json"
 CHROME_PLUS_API_URL = "https://api.github.com/repos/Bush2021/chrome_plus/releases/latest"
