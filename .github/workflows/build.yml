@@ -9,8 +9,9 @@ on:
         type: boolean
         default: false
   schedule:
-    # 每天北京时间 09:07 (UTC 01:07) 运行，避开整点高峰以减少 GitHub Actions 调度延迟
-    - cron: '7 1 * * *'
+    # 每天两次：北京时间 09:07 (UTC 01:07) 与 01:07 (UTC 17:07)
+    # 无论 GitHub Actions 正常调度还是存在 7~8 小时队列延迟，均可覆盖北京时间早 9 点左右
+    - cron: '7 1,17 * * *'
   push:
     branches: [ main ]
     paths-ignore:
