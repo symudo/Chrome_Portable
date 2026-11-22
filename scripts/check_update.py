@@ -3,12 +3,13 @@
 """
 双更新检测脚本 (Chrome + Chrome++)
 检查 Google 官方 Chrome 最新版与 Bush2021/chrome_plus 最新版插件。
-任一更新（或对应的 Release Tag 尚未在仓库中发布）即判定为 update_needed=true。
+任一更新（且未发生版本倒退、对应 Release Tag 尚未在仓库中发布）即判定为 update_needed=true。
 """
 
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -27,6 +28,34 @@ configure_utf8_stdio()
 GOOGLE_OMAHA_URL = "https://tools.google.com/service/update2"
 BUSH_INSTALLER_DATA_URL = "https://raw.githubusercontent.com/Bush2021/chrome_installer/main/data.json"
 CHROME_PLUS_API_URL = "https://api.github.com/repos/Bush2021/chrome_plus/releases/latest"
+
+_VERSION_RE = re.compile(r"^\d+(?:\.\d+)+$")
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_TAG_RE = re.compile(r"^v?(\d+(?:\.\d+)+)-v?(\d+(?:\.\d+)+)$")
+
+
+def parse_version_tuple(version_str):
+    """将点分版本号（支持前导 v）解析为可比较的整数元组。"""
+    cleaned = (version_str or "").strip().lstrip("vV")
+    if not _VERSION_RE.match(cleaned):
+        raise ValueError(f"无效版本号格式: {version_str!r}")
+    return tuple(int(part) for part in cleaned.split("."))
+
+
+def validate_chrome_info(info):
+    version = (info.get("version") or "").strip()
+    url = (info.get("url") or "").strip()
+    sha256 = (info.get("sha256") or "").strip().lower()
+    size = int(info.get("size") or 0)
+
+    if not _VERSION_RE.match(version):
+        raise RuntimeError(f"Chrome 版本号无效或为空: {version!r}")
+    if not url.startswith(("https://", "http://")):
+        raise RuntimeError(f"Chrome 安装包下载链接无效: {url!r}")
+    if not _SHA256_RE.match(sha256):
+        raise RuntimeError(f"Chrome 安装包 SHA256 无效: {sha256!r}")
+
+    return {"version": version, "url": url, "size": size, "sha256": sha256}
 
 
 def github_request(url, token=None):
@@ -70,26 +99,36 @@ def get_latest_chrome_from_omaha():
         manifest = updatecheck.find("manifest")
         if manifest is None:
             raise RuntimeError("Omaha response missing <manifest>")
-        version = manifest.attrib.get("version")
-        package = manifest.find("packages").find("package")
-        pkg_name = package.attrib.get("name")
-        pkg_size = int(package.attrib.get("size", "0"))
-        pkg_sha256 = package.attrib.get("hash_sha256")
+        packages_el = manifest.find("packages")
+        package = packages_el.find("package") if packages_el is not None else None
+        if package is None:
+            raise RuntimeError("Omaha response missing <package>")
+
+        version = manifest.attrib.get("version") or ""
+        pkg_name = package.attrib.get("name") or ""
+        if not pkg_name:
+            raise RuntimeError("Omaha response missing package name")
+        pkg_size = int(package.attrib.get("size") or "0")
+        pkg_sha256 = package.attrib.get("hash_sha256") or ""
+
+        urls_el = updatecheck.find("urls")
+        url_nodes = urls_el.findall("url") if urls_el is not None else []
         urls = [
-            u.attrib.get("codebase") + pkg_name
-            for u in updatecheck.find("urls").findall("url")
+            (u.attrib.get("codebase") or "") + pkg_name
+            for u in url_nodes
+            if u.attrib.get("codebase")
         ]
         chosen_url = next(
             (u for u in urls if u.startswith("https://") and "google.com" in u),
             urls[0] if urls else "",
         )
 
-        return {
+        return validate_chrome_info({
             "version": version,
             "url": chosen_url,
             "size": pkg_size,
             "sha256": pkg_sha256,
-        }
+        })
 
 
 def get_latest_chrome_fallback():
@@ -102,17 +141,17 @@ def get_latest_chrome_fallback():
         entry = data.get("win_stable_x64")
         if not entry:
             raise RuntimeError("No win_stable_x64 in Bush2021 data.json")
-        urls = entry.get("urls", [])
+        urls = entry.get("urls") or []
         chosen_url = next(
             (u for u in urls if u.startswith("https://") and "google.com" in u),
             urls[0] if urls else "",
         )
-        return {
+        return validate_chrome_info({
             "version": entry.get("version"),
             "url": chosen_url,
             "size": entry.get("size", 0),
             "sha256": entry.get("sha256"),
-        }
+        })
 
 
 def get_latest_chrome():
@@ -125,19 +164,27 @@ def get_latest_chrome():
 
 def get_latest_chrome_plus():
     data = github_request(CHROME_PLUS_API_URL)
-    tag = data.get("tag_name") or data.get("name") or ""
-    assets = data.get("assets", [])
+    tag = (data.get("tag_name") or data.get("name") or "").strip()
+    if not tag:
+        raise RuntimeError("chrome_plus latest release missing tag_name")
+    assets = data.get("assets") or []
     setdll_asset = next((a for a in assets if a.get("name") == "setdll.7z"), None)
     if not setdll_asset:
         raise RuntimeError(f"setdll.7z not found in chrome_plus {tag}")
 
+    url = (setdll_asset.get("browser_download_url") or "").strip()
+    if not url.startswith(("https://", "http://")):
+        raise RuntimeError(f"Invalid setdll.7z download url in chrome_plus {tag}: {url!r}")
+
     digest = setdll_asset.get("digest") or ""
     sha256 = digest.split(":", 1)[1].lower() if digest.lower().startswith("sha256:") else ""
+    if sha256 and not _SHA256_RE.match(sha256):
+        sha256 = ""
 
     return {
         "version": tag,
-        "url": setdll_asset.get("browser_download_url"),
-        "size": int(setdll_asset.get("size", 0)),
+        "url": url,
+        "size": int(setdll_asset.get("size") or 0),
         "sha256": sha256,
     }
 
@@ -148,14 +195,50 @@ def check_tag_exists(repo, tag, expected_asset=None, token=None):
         data = github_request(url, token=token)
         if data.get("draft"):
             return False
-        assets = data.get("assets", [])
+        assets = data.get("assets") or []
         if expected_asset:
-            return any(a.get("name") == expected_asset for a in assets)
-        return any(a.get("name", "").endswith(".7z") for a in assets)
+            return any(
+                a.get("name") == expected_asset and a.get("state", "uploaded") == "uploaded"
+                for a in assets
+            )
+        return any(
+            a.get("name", "").endswith(".7z") and a.get("state", "uploaded") == "uploaded"
+            for a in assets
+        )
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return False
         raise
+
+
+def get_latest_published_versions(repo, token=None):
+    """获取仓库最新正式 Release 的 (chrome_version, plus_version)，用于防止 Omaha 灰度回退。"""
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        data = github_request(url, token=token)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    tag = (data.get("tag_name") or "").strip()
+    match = _TAG_RE.match(tag)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def is_version_downgrade(chrome_ver, plus_ver, published_pair):
+    """任一组件版本号低于仓库最新正式 Release，则视为版本回退。"""
+    if not published_pair:
+        return False
+    pub_chrome, pub_plus = published_pair
+    try:
+        return (
+            parse_version_tuple(chrome_ver) < parse_version_tuple(pub_chrome)
+            or parse_version_tuple(plus_ver) < parse_version_tuple(pub_plus)
+        )
+    except ValueError:
+        return False
 
 
 def set_github_output(outputs):
@@ -163,7 +246,8 @@ def set_github_output(outputs):
     if output_path:
         with open(output_path, "a", encoding="utf-8") as f:
             for k, v in outputs.items():
-                f.write(f"{k}={v}\n")
+                clean_v = str(v).replace("\r", "").replace("\n", "")
+                f.write(f"{k}={clean_v}\n")
 
 
 def main():
@@ -193,16 +277,29 @@ def main():
     print(f"目标 Tag: {release_tag}, 目标产物: {expected_archive}")
 
     already_released = check_tag_exists(args.repo, release_tag, expected_asset=expected_archive)
+    latest_published = get_latest_published_versions(args.repo)
+    if latest_published:
+        print(f"当前已发布最新版本: Chrome {latest_published[0]} / Chrome++ {latest_published[1]}")
+
     if args.force:
         print("[INFO] 强制触发构建模式已开启 (--force)")
         update_needed = True
+    elif already_released:
+        update_needed = False
+    elif is_version_downgrade(chrome_info["version"], plus_info["version"], latest_published):
+        print(
+            f"[WARN] 检测到上游版本回退 (候选: {chrome_info['version']} / {plus_info['version']}，"
+            f"线上最新: {latest_published[0]} / {latest_published[1]})，跳过构建以防旧版覆盖 Latest。",
+            file=sys.stderr,
+        )
+        update_needed = False
     else:
-        update_needed = not already_released
+        update_needed = True
 
     if update_needed:
         print(f"[RESULT] 检测到更新！需要打包发布 (Tag {release_tag} 或目标资产尚未发布，或强制触发)")
     else:
-        print(f"[RESULT] 当前已是最新版本 (Tag {release_tag} 与资产已存在)，无需重新打包。")
+        print(f"[RESULT] 无需重新打包 (Tag {release_tag} 已发布或检测到上游版本回退)。")
 
     result = {
         "update_needed": str(update_needed).lower(),

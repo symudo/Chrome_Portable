@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-setlocal
+setlocal DisableDelayedExpansion
 
 set "WORK_DIR=%~dp0"
 set "APP_DIR=%WORK_DIR%Chrome"
@@ -29,7 +29,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = New-Object -ComObje
 
 if exist "%LNK_PATH%" (
     echo 快捷方式创建成功
-    echo 指向：%CHROME_EXE%
+    setlocal EnableDelayedExpansion
+    echo 指向：!CHROME_EXE!
+    endlocal
     exit /b 0
 ) else (
     echo 快捷方式创建失败

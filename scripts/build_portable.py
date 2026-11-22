@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Google Chrome 便携版自动化打包构建脚本
-实现：下载、哈希/大小校验、解包、剔除冗余组件、插件集成、配置合并(含UTF-16LE BOM)、
+实现：流式重试下载、哈希/大小校验、解包、剔除冗余组件、插件集成、安全编码合并配置(含UTF-16LE BOM)、
 PE 注入前后严格校验、格式压缩与全方位运行时闭环自测。
 """
 
@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -60,7 +61,22 @@ def find_7z():
     raise RuntimeError("未找到 7-Zip 工具，请安装 7-Zip 或设置 SEVEN_ZIP 环境变量。")
 
 
-def download_file(url, dest_path, expected_sha256=None, expected_size=None):
+def find_shallowest(root, pattern, want_dir=False, want_file=False):
+    """按路径层级最浅、字典序最小确定性查找目标，避免依赖文件系统 rglob 顺序。"""
+    matches = []
+    for p in Path(root).rglob(pattern):
+        if want_dir and not p.is_dir():
+            continue
+        if want_file and not p.is_file():
+            continue
+        matches.append(p)
+    if not matches:
+        return None
+    return min(matches, key=lambda p: (len(p.parts), str(p).lower()))
+
+
+def download_file(url, dest_path, expected_sha256=None, expected_size=None, retries=3):
+    """带全流级重试（涵盖读取中途断流/超时/校验失败）与原子落盘的文件下载。"""
     dest_path = Path(dest_path)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     expected_sha256 = (expected_sha256 or "").strip().lower() or None
@@ -73,40 +89,73 @@ def download_file(url, dest_path, expected_sha256=None, expected_size=None):
             print(f"[CACHE] 文件已存在且校验通过: {dest_path.name}")
             return dest_path
 
-    print(f"[DOWNLOAD] 开始下载: {url} -> {dest_path.name}")
     headers = {"User-Agent": "ChromePortableBuilder/1.0"}
-    req = urllib.request.Request(url, headers=headers)
     part_path = dest_path.with_suffix(dest_path.suffix + ".part")
+    last_err = None
 
-    sha = hashlib.sha256()
-    downloaded = 0
-    try:
-        with urlopen_with_retry(req, timeout=300) as resp, open(part_path, "wb") as out:
-            total_size = int(resp.headers.get("content-length", 0))
-            last_pct = -1
-            while chunk := resp.read(1024 * 512):
-                out.write(chunk)
-                sha.update(chunk)
-                downloaded += len(chunk)
-                if total_size > 0:
-                    pct = int(downloaded * 100 / total_size)
-                    if pct != last_pct and pct % 10 == 0:
-                        print(f"  进度: {pct}% ({downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB)")
-                        last_pct = pct
+    for attempt in range(1, retries + 1):
+        print(f"[DOWNLOAD] 开始下载 (第 {attempt}/{retries} 次): {url} -> {dest_path.name}")
+        req = urllib.request.Request(url, headers=headers)
+        sha = hashlib.sha256()
+        downloaded = 0
+        try:
+            with urlopen_with_retry(req, timeout=300, retries=1) as resp, open(part_path, "wb") as out:
+                total_size = int(resp.headers.get("content-length") or 0)
+                last_pct = -1
+                while chunk := resp.read(1024 * 512):
+                    out.write(chunk)
+                    sha.update(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        pct = int(downloaded * 100 / total_size)
+                        if pct != last_pct and pct % 10 == 0:
+                            print(f"  进度: {pct}% ({downloaded // (1024*1024)} MB / {total_size // (1024*1024)} MB)")
+                            last_pct = pct
 
-        actual_sha = sha.hexdigest().lower()
-        if expected_size is not None and downloaded != expected_size:
-            raise RuntimeError(f"下载文件大小校验失败！期望: {expected_size}, 实际: {downloaded}")
-        if expected_sha256 and actual_sha != expected_sha256:
-            raise RuntimeError(f"下载文件 SHA256 校验失败！期望: {expected_sha256}, 实际: {actual_sha}")
+            actual_sha = sha.hexdigest().lower()
+            if expected_size is not None and downloaded != expected_size:
+                raise RuntimeError(f"下载文件大小校验失败！期望: {expected_size}, 实际: {downloaded}")
+            if expected_sha256 and actual_sha != expected_sha256:
+                raise RuntimeError(f"下载文件 SHA256 校验失败！期望: {expected_sha256}, 实际: {actual_sha}")
 
-        part_path.replace(dest_path)
-    except Exception:
-        part_path.unlink(missing_ok=True)
-        raise
+            part_path.replace(dest_path)
+            print(f"[DOWNLOAD] 下载完成: {dest_path.name} ({downloaded} 字节, SHA256: {actual_sha[:16]}...)")
+            return dest_path
+        except urllib.error.HTTPError as e:
+            part_path.unlink(missing_ok=True)
+            if 400 <= e.code < 500 and e.code != 429:
+                raise
+            last_err = e
+        except Exception as e:
+            part_path.unlink(missing_ok=True)
+            last_err = e
 
-    print(f"[DOWNLOAD] 下载完成: {dest_path.name} ({downloaded} 字节, SHA256: {actual_sha[:16]}...)")
-    return dest_path
+        if attempt < retries:
+            wait = 2 * attempt
+            print(f"[RETRY] 下载中断或校验失败 ({last_err})，{wait}s 后重试...", file=sys.stderr)
+            time.sleep(wait)
+
+    raise last_err
+
+
+def decode_ini_bytes(raw_bytes):
+    """按 BOM 与空字节特征安全解码 INI，避免无 BOM 的 UTF-8 文本被静默误解为 UTF-16 乱码。"""
+    if raw_bytes.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw_bytes.decode("utf-16")
+    if raw_bytes.startswith(b"\xef\xbb\xbf"):
+        return raw_bytes.decode("utf-8-sig")
+    # 仅在明显存在 UTF-16LE 空字节特征时才按 utf-16-le 解码
+    if b"\x00" in raw_bytes and len(raw_bytes) % 2 == 0:
+        try:
+            return raw_bytes.decode("utf-16-le")
+        except UnicodeDecodeError:
+            pass
+    for enc in ("utf-8", "gbk", "latin1"):
+        try:
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw_bytes.decode("latin1")
 
 
 def parse_ini_overrides(file_path):
@@ -135,48 +184,56 @@ def parse_ini_overrides(file_path):
 
 
 def merge_chrome_ini(base_text, overrides_dict):
-    """合并配置到基线 INI 文本中，保持注释与格式，修改或添加对应键"""
+    """合并配置到基线 INI 文本中（键名大小写不敏感），保持注释与格式，修改或添加对应键。"""
+    # 建立小写键名到 (原始覆盖键名, 值) 的映射，兼容 Windows INI 大小写不敏感规范
+    norm_overrides = {
+        sec.lower(): {k.lower(): (k, v) for k, v in kv.items()}
+        for sec, kv in overrides_dict.items()
+    }
     lines = base_text.splitlines()
     new_lines = []
     current_section = None
-    applied_keys = {sec: set() for sec in overrides_dict}
+    applied_keys = {sec: set() for sec in norm_overrides}
 
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
-            if current_section in overrides_dict:
-                for k, v in overrides_dict[current_section].items():
-                    if k not in applied_keys[current_section]:
-                        new_lines.append(f"{k}={v}")
-                        applied_keys[current_section].add(k)
+            if current_section in norm_overrides:
+                for k_low, (orig_k, v) in norm_overrides[current_section].items():
+                    if k_low not in applied_keys[current_section]:
+                        new_lines.append(f"{orig_k}={v}")
+                        applied_keys[current_section].add(k_low)
             current_section = stripped[1:-1].strip().lower()
             new_lines.append(line)
             continue
 
-        if current_section in overrides_dict and "=" in stripped and not stripped.startswith(";"):
-            k, _ = stripped.split("=", 1)
-            k = k.strip()
-            if k in overrides_dict[current_section]:
-                new_lines.append(f"{k}={overrides_dict[current_section][k]}")
-                applied_keys[current_section].add(k)
+        if current_section in norm_overrides and "=" in stripped and not stripped.startswith(";"):
+            k_raw, _ = stripped.split("=", 1)
+            k_low = k_raw.strip().lower()
+            if k_low in norm_overrides[current_section]:
+                orig_k, v = norm_overrides[current_section][k_low]
+                if k_low not in applied_keys[current_section]:
+                    new_lines.append(f"{orig_k}={v}")
+                    applied_keys[current_section].add(k_low)
+                # 若基线中已存在重复的同键，后续重复行也直接去重跳过
                 continue
 
         new_lines.append(line)
 
-    if current_section in overrides_dict:
-        for k, v in overrides_dict[current_section].items():
-            if k not in applied_keys[current_section]:
-                new_lines.append(f"{k}={v}")
-                applied_keys[current_section].add(k)
+    if current_section in norm_overrides:
+        for k_low, (orig_k, v) in norm_overrides[current_section].items():
+            if k_low not in applied_keys[current_section]:
+                new_lines.append(f"{orig_k}={v}")
+                applied_keys[current_section].add(k_low)
 
     # 追加基线中不存在的新 section
-    for sec, kv in overrides_dict.items():
-        remaining = {k: v for k, v in kv.items() if k not in applied_keys[sec]}
+    for sec, kv in norm_overrides.items():
+        remaining = [(orig_k, v) for k_low, (orig_k, v) in kv.items() if k_low not in applied_keys[sec]]
         if remaining:
             new_lines.append("")
             new_lines.append(f"[{sec}]")
-            for k, v in remaining.items():
-                new_lines.append(f"{k}={v}")
+            for orig_k, v in remaining:
+                new_lines.append(f"{orig_k}={v}")
 
     return "\r\n".join(new_lines) + "\r\n"
 
@@ -217,11 +274,12 @@ def get_pe_imports(file_path):
     for i in range(num_sections):
         sec = data[sections_offset + i * 40 : sections_offset + (i + 1) * 40]
         vsize, vaddr, rsize, raddr = struct.unpack("<IIII", sec[8:24])
-        sections.append((vaddr, max(vsize, rsize), raddr))
+        sections.append((vaddr, vsize, rsize, raddr))
 
     def rva_to_offset(rva):
-        for vaddr, size, raddr in sections:
-            if vaddr <= rva < vaddr + size:
+        for vaddr, vsize, rsize, raddr in sections:
+            span = max(vsize, rsize)
+            if rsize > 0 and vaddr <= rva < vaddr + span and (rva - vaddr) < rsize:
                 return raddr + (rva - vaddr)
         return None
 
@@ -261,6 +319,27 @@ def assert_pe_injected(exe_path, expected_min_count=None):
     return imports
 
 
+def terminate_processes_for_exe(exe_path):
+    """精准清理可执行路径等于测试 chrome.exe 的残留子进程，避免锁住临时目录，绝不误杀用户正常 Chrome。"""
+    env = os.environ.copy()
+    env["TARGET_TEST_EXE"] = str(Path(exe_path).resolve())
+    ps_script = (
+        "$t = $env:TARGET_TEST_EXE; "
+        "Get-CimInstance Win32_Process -Filter \"Name = 'chrome.exe'\" | "
+        "Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -ieq $t) } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+            env=env,
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
 def extract_with_7z(seven_zip, archive_path, output_dir):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     cmd = [seven_zip, "x", str(archive_path), f"-o{output_dir}", "-y"]
@@ -284,7 +363,7 @@ def build(
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. 下载文件并校验完整性
+    # 1. 下载文件并校验完整性（带流级重试）
     installer_name = f"chrome_installer_{chrome_version}_x64.exe"
     installer_path = DOWNLOADS_DIR / installer_name
     download_file(chrome_url, installer_path, expected_sha256=chrome_sha256)
@@ -306,27 +385,30 @@ def build(
         stage_dir = temp_dir / "stage"
         chrome_app_dir = stage_dir / "Chrome"
 
-        # 2. 解压 Chrome 安装包
+        # 2. 解压 Chrome 安装包（按路径深度最浅确定性定位）
         print("[EXTRACT] 正在解压 Chrome 离线安装程序...")
         extract_with_7z(seven_zip, installer_path, raw_extract)
 
-        candidate_bin = list(raw_extract.rglob("Chrome-bin"))
-        candidate_exe = list(raw_extract.rglob("chrome.exe"))
+        source_bin = find_shallowest(raw_extract, "Chrome-bin", want_dir=True)
+        if source_bin is None:
+            exe_match = find_shallowest(raw_extract, "chrome.exe", want_file=True)
+            if exe_match is not None:
+                source_bin = exe_match.parent
 
-        if not candidate_bin and not candidate_exe:
-            chrome_7z_list = list(raw_extract.rglob("chrome.7z")) + list(raw_extract.rglob("CHROME.7Z"))
-            if chrome_7z_list:
-                chrome_7z = chrome_7z_list[0]
+        if source_bin is None:
+            chrome_7z = find_shallowest(raw_extract, "chrome.7z", want_file=True) or find_shallowest(
+                raw_extract, "CHROME.7Z", want_file=True
+            )
+            if chrome_7z is not None:
                 print(f"[EXTRACT] 正在解包内部核心文件: {chrome_7z.name} ...")
                 extract_with_7z(seven_zip, chrome_7z, chrome_bin_dir)
-                candidate_bin = list(chrome_bin_dir.rglob("Chrome-bin"))
-                candidate_exe = list(chrome_bin_dir.rglob("chrome.exe"))
+                source_bin = find_shallowest(chrome_bin_dir, "Chrome-bin", want_dir=True)
+                if source_bin is None:
+                    exe_match = find_shallowest(chrome_bin_dir, "chrome.exe", want_file=True)
+                    if exe_match is not None:
+                        source_bin = exe_match.parent
 
-        if candidate_bin:
-            source_bin = candidate_bin[0]
-        elif candidate_exe:
-            source_bin = candidate_exe[0].parent
-        else:
+        if source_bin is None:
             raise RuntimeError("解包后的目录中未找到 Chrome-bin 或 chrome.exe")
 
         print(f"[LAYOUT] 定位 Chrome 程序源目录: {source_bin}")
@@ -343,13 +425,13 @@ def build(
                 removed_count += 1
         print(f"[CLEAN] 共清除 {removed_count} 个冗余文件。")
 
-        # 4. 解压 Chrome++ 并集成
+        # 4. 解压 Chrome++ 并集成（最浅路径确定性定位）
         print("[EXTRACT] 正在解包 Chrome++ 插件...")
         extract_with_7z(seven_zip, plus_archive_path, plus_extract)
 
-        version_dll = next(plus_extract.rglob("version-x64.dll"), None)
-        setdll_exe = next(plus_extract.rglob("setdll-x64.exe"), None)
-        base_ini = next(plus_extract.rglob("chrome++.ini"), None)
+        version_dll = find_shallowest(plus_extract, "version-x64.dll", want_file=True)
+        setdll_exe = find_shallowest(plus_extract, "setdll-x64.exe", want_file=True)
+        base_ini = find_shallowest(plus_extract, "chrome++.ini", want_file=True)
 
         if not version_dll or not setdll_exe or not base_ini:
             raise RuntimeError("setdll.7z 中缺少必要的 version-x64.dll, setdll-x64.exe 或 chrome++.ini")
@@ -358,25 +440,15 @@ def build(
         shutil.copy2(version_dll, target_version_dll)
         print(f"[INTEGRATE] 已放置插件 DLL: {target_version_dll.name}")
 
-        # 5. 配置合并 (单一事实来源：以 chrome++.override.ini 为准，写入带 BOM 的 UTF-16LE)
+        # 5. 配置合并 (单一事实来源：以 chrome++.override.ini 为准，安全解码并写入带 BOM 的 UTF-16LE)
         print("[CONFIG] 正在合并 Chrome++ 配置文件...")
-        ini_raw = base_ini.read_bytes()
-        ini_text = None
-        for enc in ("utf-16", "utf-16-le", "utf-8-sig", "utf-8", "gbk"):
-            try:
-                ini_text = ini_raw.decode(enc)
-                break
-            except Exception:
-                continue
-        if not ini_text:
-            ini_text = ini_raw.decode("latin1")
+        ini_text = decode_ini_bytes(base_ini.read_bytes())
 
         override_file = REPO_ROOT / "chrome++" / "chrome++.override.ini"
         overrides = parse_ini_overrides(override_file)
 
         merged_ini_text = merge_chrome_ini(ini_text, overrides)
         target_ini = chrome_app_dir / "chrome++.ini"
-        # 显式写入 FF FE (UTF-16LE BOM)，与上游基线及 Windows API 规范完全一致
         target_ini.write_bytes(b"\xff\xfe" + merged_ini_text.encode("utf-16-le"))
         print(f"[CONFIG] 配置文件写入完成: {target_ini.name} (UTF-16LE with BOM)")
 
@@ -439,9 +511,9 @@ def build(
         sha256_file.write_text(f"{archive_sha256}  {archive_name}\n", encoding="utf-8")
         print(f"[CHECKSUM] 已生成校验文件: {sha256_file.name}")
 
-        # 9. 全方位闭环自测验证（含单引号与空格路径、BOM/Windows API 读配置、PE 首位注入、开始.bat 与运行时便携目录生成）
+        # 9. 全方位闭环自测验证（含单引号/&/!/空格路径、BOM/Windows API 读配置、PE 首位注入、开始.bat 与运行时便携目录生成）
         print("\n=== [全方位闭环自测验证 (Smoke Test)] ===")
-        test_extract_dir = temp_dir / "Bob's Chrome Test"
+        test_extract_dir = temp_dir / "Bob's R&D! Chrome Test"
         extract_with_7z(seven_zip, archive_path, test_extract_dir)
         test_chrome_exe = test_extract_dir / "Chrome" / "chrome.exe"
         test_version_dll = test_extract_dir / "Chrome" / "version.dll"
@@ -468,9 +540,9 @@ def build(
                     )
         print("[TEST 2/4] UTF-16LE BOM 及 Windows 原生 INI API 实测校验通过。")
 
-        # 9.3 实测含单引号与空格路径下的 开始.bat 快捷方式生成
+        # 9.3 实测含单引号/&/!/空格路径下的 开始.bat 快捷方式生成（以相对名在目标目录执行，与双击行为一致）
         bat_res = subprocess.run(
-            ["cmd", "/c", str(test_bat)],
+            ["cmd", "/c", "开始.bat"],
             cwd=str(test_extract_dir),
             input="\n",
             capture_output=True,
@@ -480,14 +552,14 @@ def build(
             timeout=30,
         )
         test_lnk = test_extract_dir / "Chrome.lnk"
-        if bat_res.returncode != 0 or not test_lnk.exists():
+        if bat_res.returncode != 0 or not test_lnk.exists() or bat_res.stderr.strip():
             raise RuntimeError(
-                f"自检失败: 开始.bat 在含特殊字符路径下执行失败 (code={bat_res.returncode})\n{bat_res.stdout}\n{bat_res.stderr}"
+                f"自检失败: 开始.bat 在含特殊字符路径下执行异常 (code={bat_res.returncode})\n"
+                f"stdout={bat_res.stdout}\nstderr={bat_res.stderr}"
             )
-        print(f"[TEST 3/4] 开始.bat 快捷方式生成验证通过（含单引号/空格路径: {test_extract_dir.name}）。")
+        print(f"[TEST 3/4] 开始.bat 快捷方式生成验证通过（含特殊字符路径: {test_extract_dir.name}）。")
 
         # 9.4 实测 Headless 启动并验证 Chrome++ 便携数据/缓存目录生效
-        # Chrome++ 会由父进程拉起带 --portable / --user-data-dir / --disk-cache-dir 的子进程后立即 ExitProcess(0)
         test_data_dir = test_extract_dir / "Data"
         test_cache_dir = test_extract_dir / "Cache"
         for p in (test_data_dir, test_cache_dir):
@@ -502,26 +574,28 @@ def build(
             "--disable-gpu",
             "about:blank",
         ]
-        smoke_res = subprocess.run(smoke_cmd, capture_output=True, text=True, timeout=30)
-        if smoke_res.returncode != 0:
-            raise RuntimeError(
-                f"自检失败: Headless 启动返回非 0 退出码 ({smoke_res.returncode})\n{smoke_res.stderr}"
-            )
+        try:
+            smoke_res = subprocess.run(smoke_cmd, capture_output=True, text=True, timeout=30)
+            if smoke_res.returncode != 0:
+                raise RuntimeError(
+                    f"自检失败: Headless 启动返回非 0 退出码 ({smoke_res.returncode})\n{smoke_res.stderr}"
+                )
 
-        # 轮询等待 Chrome++ 拉起的子进程创建便携 Data 与 Cache 目录
-        for _ in range(20):
-            if test_data_dir.is_dir() and test_cache_dir.is_dir():
-                break
-            time.sleep(0.5)
+            for _ in range(20):
+                if test_data_dir.is_dir() and test_cache_dir.is_dir():
+                    break
+                time.sleep(0.5)
 
-        if not test_data_dir.is_dir() or not test_cache_dir.is_dir():
-            raise RuntimeError(
-                f"自检失败: 启动后未在便携路径生成 Data/Cache 目录 ({test_extract_dir})，Chrome++ 可能未生效！"
-            )
-        print("[TEST 4/4] Headless 启动正常 (code=0)，已确认便携目录生成: Data/ 与 Cache/")
+            if not test_data_dir.is_dir() or not test_cache_dir.is_dir():
+                raise RuntimeError(
+                    f"自检失败: 启动后未在便携路径生成 Data/Cache 目录 ({test_extract_dir})，Chrome++ 可能未生效！"
+                )
+            print("[TEST 4/4] Headless 启动正常 (code=0)，已确认便携目录生成: Data/ 与 Cache/")
+        finally:
+            time.sleep(1)
+            terminate_processes_for_exe(test_chrome_exe)
+
         print("=== 全方位闭环自测全部通过，产物准备就绪！===\n")
-
-        time.sleep(1)
         return {
             "archive_name": archive_name,
             "archive_path": str(archive_path),

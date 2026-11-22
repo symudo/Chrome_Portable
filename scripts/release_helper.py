@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GitHub Release 原子发布辅助脚本
-采用“先草稿 → 交叉校验哈希 → 流式上传资产 → 正式公开”的原子发布流程，杜绝空 Release 窗口。
+采用“先草稿 → 交叉校验哈希 → 流式上传资产（重试前清理残缺项）→ 正式公开”的原子发布流程。
 """
 
 import argparse
@@ -10,6 +10,7 @@ import datetime
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,6 +26,8 @@ from common import (
 
 configure_utf8_stdio()
 
+BJ_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
 
 def format_size(bytes_num):
     for unit in ["B", "KB", "MB", "GB"]:
@@ -35,7 +38,7 @@ def format_size(bytes_num):
 
 
 def render_release_body(chrome_version, plus_version, archive_name, archive_size, archive_sha256):
-    date_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    date_str = datetime.datetime.now(BJ_TZ).strftime("%Y-%m-%d")
     return f"""自动构建的 Google Chrome 64位 Windows 便携版，集成 [Chrome++](https://github.com/Bush2021/chrome_plus) 增强插件。
 
 > **安装与使用说明**：
@@ -89,7 +92,6 @@ def find_existing_release(repo, tag, token):
         if e.code != 404:
             raise
 
-    # 已发布接口查不到 draft，遍历近期 releases 复用未完成的同 tag 草稿
     list_url = f"https://api.github.com/repos/{repo}/releases?per_page=30"
     req = urllib.request.Request(list_url, headers=headers)
     with urlopen_with_retry(req, timeout=30) as resp:
@@ -130,6 +132,23 @@ def prepare_release(repo, tag, title, body, token):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def delete_assets_by_names(repo, release_id, target_names, token):
+    """实时拉取 Release 资产列表并精确删除同名旧资产或上次中断遗留的 starter 残缺资产。"""
+    headers = _github_headers(token)
+    assets_url = f"https://api.github.com/repos/{repo}/releases/{release_id}/assets?per_page=100"
+    req = urllib.request.Request(assets_url, headers=headers)
+    with urlopen_with_retry(req, timeout=30) as resp:
+        assets = json.loads(resp.read().decode("utf-8"))
+
+    for asset in assets:
+        name = asset.get("name")
+        if name in target_names:
+            print(f"[ASSET] 删除同名/残缺资产: {name} (state={asset.get('state')}) ...")
+            del_req = urllib.request.Request(asset["url"], headers=headers, method="DELETE")
+            with urlopen_with_retry(del_req, timeout=30):
+                pass
+
+
 def publish_draft_release(repo, release_id, token):
     """将草稿 Release 翻转为正式公开状态。"""
     headers = _github_headers(token)
@@ -140,8 +159,8 @@ def publish_draft_release(repo, release_id, token):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def upload_asset_streaming(upload_url_template, file_path, token, retries=3):
-    """流式上传大文件资产（避免一次性读入内存），支持失败重试。"""
+def upload_asset_streaming(repo, release_id, upload_url_template, file_path, token, retries=3):
+    """流式上传大文件资产（避免一次性读入内存）；失败重试前自动清理服务端残缺资产防止 422。"""
     file_path = Path(file_path)
     if not file_path.exists():
         raise FileNotFoundError(f"文件不存在: {file_path}")
@@ -169,13 +188,22 @@ def upload_asset_streaming(upload_url_template, file_path, token, retries=3):
                     res = json.loads(resp.read().decode("utf-8"))
                     print(f"[UPLOAD] 资产上传成功: {res.get('browser_download_url')}")
                     return res
+        except urllib.error.HTTPError as e:
+            # 4xx 中仅 429 限流与 422（可能由上次断流残留 starter 资产引起）值得清理后重试
+            if 400 <= e.code < 500 and e.code not in (422, 429):
+                raise
+            last_err = e
         except Exception as e:
             last_err = e
-            if attempt < retries:
-                import time
-                wait = 3 * attempt
-                print(f"[RETRY] 上传失败 ({e})，{wait}s 后重试...", file=sys.stderr)
-                time.sleep(wait)
+
+        if attempt < retries:
+            wait = 3 * attempt
+            print(f"[RETRY] 上传失败 ({last_err})，清理可能残留的同名资产并在 {wait}s 后重试...", file=sys.stderr)
+            try:
+                delete_assets_by_names(repo, release_id, {file_path.name}, token)
+            except Exception as clean_err:
+                print(f"[WARN] 清理残缺资产失败: {clean_err}", file=sys.stderr)
+            time.sleep(wait)
     raise last_err
 
 
@@ -231,19 +259,12 @@ def main():
     release_id = release_data["id"]
     upload_url = release_data["upload_url"]
 
-    # 2. 仅精确删除与本次上传完全同名的旧资产，不误伤其他架构/文件
-    headers = _github_headers(token)
-    target_names = {archive_path.name, sha256_path.name}
-    for asset in release_data.get("assets", []):
-        if asset.get("name") in target_names:
-            print(f"[ASSET] 删除同名旧资产: {asset.get('name')} ...")
-            del_req = urllib.request.Request(asset["url"], headers=headers, method="DELETE")
-            with urlopen_with_retry(del_req, timeout=30):
-                pass
+    # 2. 精确删除与本次上传同名的旧资产/残缺资产
+    delete_assets_by_names(args.repo, release_id, {archive_path.name, sha256_path.name}, token)
 
-    # 3. 流式上传资产
-    upload_asset_streaming(upload_url, archive_path, token)
-    upload_asset_streaming(upload_url, sha256_path, token)
+    # 3. 流式上传资产（重试前自动清理残缺项）
+    upload_asset_streaming(args.repo, release_id, upload_url, archive_path, token)
+    upload_asset_streaming(args.repo, release_id, upload_url, sha256_path, token)
 
     # 4. 若为草稿，全部上传成功后再正式公开
     if release_data.get("draft"):
